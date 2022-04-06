@@ -21,18 +21,19 @@
 #include <esp_http_server.h>
 
 #include <sys/param.h>
-#include "tcpip_adapter.h"
+#include "esp_netif.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
-#define LED_R 0
-#define LED_G 2
-#define LED_B 4
+
+#define LED_B 2
+
 
 static EventGroupHandle_t s_wifi_event_group;
 
 static EventGroupHandle_t wifi_event_group;
+static esp_netif_t * netif_ap;
 
 const int CONNECTED_BIT = BIT0;
 
@@ -56,6 +57,26 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
         ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d",
                  MAC2STR(event->mac), event->aid);
+    } else if (event_id == IP_EVENT_STA_GOT_IP){
+        gpio_set_level(LED_B, 1);
+        GOT_IP = true;
+        xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
+    } else if (event_id == WIFI_EVENT_STA_START){
+        esp_wifi_connect();
+    }  else if (event_id == WIFI_EVENT_STA_DISCONNECTED){
+    
+        ESP_LOGI(TAG, "SYSTEM_EVENT_STA_DISCONNECTED %d ", esp_wifi_connect());
+        esp_wifi_connect();
+        if (GOT_IP == false)
+        {
+            ESP_LOGI(TAG, "Sorry wrong PSW");
+            memset(&__PWD[0], 0, sizeof(__PWD));
+            memset(&__SSID[0], 0, sizeof(__SSID));
+            esp_sleep_enable_timer_wakeup(100000);
+            gpio_set_level(LED_B, 0);
+            esp_deep_sleep_start();
+        }
+        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
     }
 
     ESP_LOGI(TAG, "wifi_event_handler wifi_event_handler wifi_event_handler");
@@ -71,8 +92,6 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
     case SYSTEM_EVENT_STA_GOT_IP:
         ESP_LOGI(TAG, "SYSTEM_EVENT_STA_GOT_IP ");
         ESP_LOGI(TAG, "Login Success");
-        gpio_set_level(LED_R, 1);
-        gpio_set_level(LED_G, 1);
         gpio_set_level(LED_B, 1);
         GOT_IP = true;
         xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
@@ -87,8 +106,6 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
             memset(&__PWD[0], 0, sizeof(__PWD));
             memset(&__SSID[0], 0, sizeof(__SSID));
             esp_sleep_enable_timer_wakeup(100000);
-            gpio_set_level(LED_R, 0);
-            gpio_set_level(LED_G, 0);
             gpio_set_level(LED_B, 0);
             esp_deep_sleep_start();
         }
@@ -108,7 +125,7 @@ static esp_err_t servePage_get_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "<style>");
     httpd_resp_sendstr_chunk(req, "form {display: grid;padding: 1em; background: #f9f9f9; border: 1px solid #c1c1c1; margin: 2rem auto 0 auto; max-width: 400px; padding: 1em;}}");
     httpd_resp_sendstr_chunk(req, "form input {background: #fff;border: 1px solid #9c9c9c;}");
-    httpd_resp_sendstr_chunk(req, "form button {background: lightgrey; padding: 0.7em;width: 100%; border: 0;");
+    httpd_resp_sendstr_chunk(req, "form button {background: pink; padding: 0.7em;width: 100%; border: 0;");
     httpd_resp_sendstr_chunk(req, "label {padding: 0.5em 0.5em 0.5em 0;}");
     httpd_resp_sendstr_chunk(req, "input {padding: 0.7em;margin-bottom: 0.5rem;}");
     httpd_resp_sendstr_chunk(req, "input:focus {outline: 10px solid gold;}");
@@ -129,7 +146,7 @@ static esp_err_t servePage_get_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "</form>");
 
     httpd_resp_sendstr_chunk(req, "<script>");
-    httpd_resp_sendstr_chunk(req, "document.getElementById(\"loginForm\").addEventListener(\"submit\", (e) => {e.preventDefault(); const formData = new FormData(e.target); const data = Array.from(formData.entries()).reduce((memo, pair) => ({...memo, [pair[0]]: pair[1],  }), {}); var xhr = new XMLHttpRequest(); xhr.open(\"POST\", \"http://192.168.1.1/connection\", true); xhr.setRequestHeader('Content-Type', 'application/json'); xhr.send(JSON.stringify(data)); document.getElementById(\"output\").innerHTML = JSON.stringify(data);});");
+    httpd_resp_sendstr_chunk(req, "document.getElementById(\"loginForm\").addEventListener(\"submit\", (e) => {e.preventDefault(); const formData = new FormData(e.target); const data = Array.from(formData.entries()).reduce((memo, pair) => ({...memo, [pair[0]]: pair[1],  }), {}); var xhr = new XMLHttpRequest(); xhr.open(\"POST\", \"http://192.168.4.1/connection\", true); xhr.setRequestHeader('Content-Type', 'application/json'); xhr.send(JSON.stringify(data)); document.getElementById(\"output\").innerHTML = JSON.stringify(data);});");
     httpd_resp_sendstr_chunk(req, "</script>");
 
     httpd_resp_sendstr_chunk(req, "</body></html>");
@@ -173,6 +190,7 @@ static esp_err_t psw_ssid_get_handler(httpd_req_t *req)
         ESP_LOGI(TAG, "%.*s", ret, buf);
         ESP_LOGI(TAG, "===================================="); */
         cJSON *root = cJSON_Parse(buf);
+        printf("The buffer is : %s\n",buf);
 
         sprintf(__SSID, "%s", cJSON_GetObjectItem(root, "ssid")->valuestring);
         sprintf(__PWD, "%s", cJSON_GetObjectItem(root, "pwd")->valuestring);
@@ -221,12 +239,15 @@ void wifi_init_softap()
 
     if (strlen(__PWD) && strlen(__SSID) != 0)
     {
-        tcpip_adapter_init();
+        esp_netif_init();
         wifi_event_group = xEventGroupCreate();
         ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
         ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
         wifi_config_t wifi_config = {};
         strcpy((char *)wifi_config.sta.ssid, __SSID);
@@ -244,10 +265,11 @@ void wifi_init_softap()
     {
         s_wifi_event_group = xEventGroupCreate();
 
-        tcpip_adapter_init();
+        esp_netif_init();
 
         ESP_ERROR_CHECK(esp_event_loop_create_default());
         ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL)); //-> just here to get rid of startup error
+        netif_ap = esp_netif_create_default_wifi_ap();
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();       //= WIFI_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -270,12 +292,15 @@ void wifi_init_softap()
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
         ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
 
-        tcpip_adapter_ip_info_t ip_info;
-        IP4_ADDR(&ip_info.ip, 192, 168, 1, 1);
-        IP4_ADDR(&ip_info.gw, 192, 168, 1, 1);
+        esp_netif_ip_info_t ip_info;
+        IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
+        IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
         IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
 
-        tcpip_adapter_ap_start((uint8_t *)"9C:B6:D0:E7:30:0F", &ip_info);
+         
+        esp_netif_dhcps_stop(netif_ap);
+        esp_netif_set_ip_info(netif_ap, &ip_info);
+        esp_netif_dhcps_start(netif_ap);
 
         ESP_ERROR_CHECK(esp_wifi_start());
     }
@@ -286,12 +311,8 @@ void wifi_init_softap()
 void app_main()
 {
     //set RGB PINs
-    gpio_pad_select_gpio(LED_R);
-    gpio_pad_select_gpio(LED_G);
     gpio_pad_select_gpio(LED_B);
     
-    gpio_set_direction(LED_R, GPIO_MODE_OUTPUT);
-    gpio_set_direction(LED_G, GPIO_MODE_OUTPUT);
     gpio_set_direction(LED_B, GPIO_MODE_OUTPUT);
 
     esp_err_t ret = nvs_flash_init();
